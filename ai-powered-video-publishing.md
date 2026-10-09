@@ -2,7 +2,7 @@ author: Chanin Nantasenamat
 id: ai-powered-video-publishing
 categories: snowflake-site:taxonomy/solution-center/certification/quickstart,snowflake-site:taxonomy/product/ai,snowflake-site:taxonomy/snowflake-feature/cortex-llm-functions
 language: en
-summary: Build VidPrep, a Streamlit-in-Snowflake app that uses AI_TRANSCRIBE and AI_COMPLETE to generate word-accurate video chapters, descriptions, SEO metadata, thumbnails, and captions.
+summary: Build VidPrep, a Streamlit-in-Snowflake app that uses AI_TRANSCRIBE and AI_COMPLETE to draft video chapters, descriptions, SEO metadata, thumbnails, and captions.
 environments: web
 status: Published
 feedback link: https://github.com/Snowflake-Labs/sfguides/issues
@@ -10,25 +10,26 @@ fork repo link: https://github.com/sfc-gh-cnantasenamat/ai-powered-video-publish
 
 
 # Build an AI-Powered Video Publishing App on Snowflake
-<!-- ------------------------ -->
 ## Overview
 
-Creators publishing a video usually have to write a description, mark chapter timestamps, pick SEO keywords, choose a thumbnail, and write captions, all by hand and all after the fact. VidPrep automates this end to end: give it a video file or a YouTube link, and it produces a word-accurate transcript, real (not guessed) chapter timestamps, a description, SEO titles and keywords, thumbnail candidates, pull quotes, caption files, and an FAQ, all backed by Snowflake Cortex.
+Creators publishing a video usually have to write a description, mark chapter timestamps, pick SEO keywords, choose a thumbnail, and write captions. VidPrep prepares drafts of these outputs from an uploaded video or audio file using Snowflake Cortex. Review the transcript and generated copy before publishing; transcription and model output can contain errors.
 
 The core design principle behind VidPrep is that a large language model should never be trusted to emit a timestamp directly, because it can hallucinate one that doesn't correspond to anything said in the video. Instead, the model is only ever asked to point at a position in a real, transcribed word array, and the actual timestamp is looked up in code from that position. This guide walks through that architecture and how to build and deploy the whole app on Snowflake.
 
 ![VidPrep architecture: video upload through AI-generated titles, descriptions, timestamps, thumbnails, and captions](assets/vidprep-flow-diagram.png)
+
+Read the solid arrows as processing order, not unconditional execution: cached results can skip work, and extras run only when requested. The warehouse provides the SQL query context; Cortex runs AI inference on its own compute. The diagram's warehouse arrows indicate SQL calls, not the location of model execution.
 
 ### What You'll Learn
 - How to use `AI_TRANSCRIBE` to produce word-level timestamped transcripts, including chunking media that exceeds its length limit
 - How to use `AI_COMPLETE` with a structured JSON response format to extract chapters, descriptions, and SEO metadata
 - Why timestamps should be resolved from real transcript data in code, never generated directly by a model
 - How to build a multi-tab Streamlit UI with lazy, cached AI generation per tab
-- How to deploy a Streamlit app that needs outbound internet access (via `yt-dlp`) using Snowpark Container Services and an External Access Integration
+- How to deploy a Streamlit app on the container runtime, with a compute pool and an External Access Integration for installing Python packages from PyPI
 
 ### What You'll Build
 VidPrep, a Streamlit-in-Snowflake app, with:
-- An **Overview** tab with generated chapters (clickable, deep-linking into the source video), a video preview, and a copy-paste description block
+- An **Overview** tab with generated chapters (clickable: each timestamp seeks the preview player), a video preview, and a copy-paste description block
 - A **Titles & SEO** tab with title suggestions, a YouTube category pick, an end-screen suggestion, and a free SEO checklist
 - A **Thumbnails & Clips** tab with real extracted thumbnail frames and verbatim pull quotes
 - A **Captions & FAQ** tab with downloadable `.srt`/`.vtt` caption files and a generated FAQ
@@ -41,18 +42,21 @@ VidPrep, a Streamlit-in-Snowflake app, with:
 
 ![VidPrep Captions & FAQ tab: downloadable caption files and a generated, timestamp-linked FAQ](assets/05-output-captions-faq.png)
 
+These screenshots show a synthetic demo upload and its generated results. The SEO checklist includes warnings, and generated copy should always be reviewed before publishing.
+
 ### Prerequisites
 - Access to a [Snowflake account](https://signup.snowflake.com/?utm_source=snowflake-devrel&utm_medium=developer-guides&utm_cta=developer-guides)
-- A role with privileges to create a warehouse, database, stage, compute pool, network rule, and external access integration (e.g. `ACCOUNTADMIN`, or an equivalent custom role)
+- A role with privileges to create a warehouse, database, stage, compute pool, and external access integration (e.g. `ACCOUNTADMIN`, or an equivalent custom role)
 - [Snowflake CLI](https://docs.snowflake.com/en/developer-guide/snowflake-cli/index) (`snow`) installed locally
 - Python 3.11+ installed locally
 - Familiarity with Python and basic SQL
 
-<!-- ------------------------ -->
 ## Setup
 
 ### Create the Snowflake objects
-Run the following as a role with sufficient privileges. This creates a dedicated warehouse, database/schema, an internal stage (used to hand media files to `AI_TRANSCRIBE`), a compute pool for the Streamlit container runtime, and two External Access Integrations: one so the app can reach YouTube, and one so the container runtime can install the Python dependencies in `pyproject.toml` from PyPI (container runtime apps have no PyPI access by default).
+Use a dedicated tutorial environment, and record which resources you create. Do not reuse or replace another project's app. Cortex calls and container compute incur usage charges.
+
+Run the following as a role with sufficient privileges. This creates a dedicated warehouse, database/schema, an internal stage (used to hand media files to `AI_TRANSCRIBE`), a compute pool for the Streamlit container runtime, and an External Access Integration so the container runtime can install the Python dependencies in `pyproject.toml` from PyPI (container runtime apps have no PyPI access by default).
 
 ```sql
 -- XSMALL is enough here: the AI_TRANSCRIBE/AI_COMPLETE calls run on Cortex's
@@ -70,15 +74,6 @@ CREATE COMPUTE POOL IF NOT EXISTS VIDPREP_COMPUTE_POOL
   MAX_NODES = 1
   INSTANCE_FAMILY = CPU_X64_XS;
 
-CREATE NETWORK RULE IF NOT EXISTS VIDPREP_EGRESS_RULE
-  MODE = EGRESS
-  TYPE = HOST_PORT
-  VALUE_LIST = ('youtube.com', '*.youtube.com', '*.googlevideo.com');
-
-CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS VIDPREP_EAI
-  ALLOWED_NETWORK_RULES = (VIDPREP_EGRESS_RULE)
-  ENABLED = TRUE;
-
 -- Container runtime apps need this to install pyproject.toml's dependencies
 -- from PyPI. SNOWFLAKE.EXTERNAL_ACCESS.PYPI_RULE is a Snowflake-managed
 -- network rule, so no separate CREATE NETWORK RULE is needed for it.
@@ -94,7 +89,7 @@ cd ai-powered-video-publishing
 ```
 
 ### Review the dependencies
-The app's `pyproject.toml` pulls in everything needed, including `yt-dlp` for media acquisition, `imageio-ffmpeg` for a bundled ffmpeg binary (the container runtime has no system ffmpeg), and `deno`, which `yt-dlp` needs as a JavaScript runtime to solve YouTube's signature challenges:
+The app's `pyproject.toml` is short. Besides Streamlit and the Snowflake connector, it only needs `imageio-ffmpeg` for a bundled ffmpeg binary, because the container runtime has no system ffmpeg:
 
 ```toml
 [project]
@@ -103,11 +98,8 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "snowflake-connector-python>=3.3.0",
-    "streamlit[snowflake]>=1.57.0",
-    "webvtt-py>=0.5.1",
-    "yt-dlp[default]>=2026.8.19",
+    "streamlit[snowflake]>=1.64.0",
     "imageio-ffmpeg>=0.5.1",
-    "deno>=2.9.0",
 ]
 ```
 
@@ -129,71 +121,52 @@ def run_query(sql: str, params=None):
     return cur.fetchall()
 ```
 
-For local development, create `.streamlit/secrets.toml`:
+For local development, use an existing named Snowflake connection without copying credentials into the project. Start the app with the intended profile explicitly selected:
 
-```toml
-[connections.snowflake]
-account = "<your_account_identifier>"
-user = "<your_username>"
-password = "<your_password>"
-warehouse = "VIDPREP_WH"
-role = "<your_role>"
-database = "VIDPREP_DB"
-schema = "APPS"
+```bash
+SNOWFLAKE_DEFAULT_CONNECTION_NAME=<your_connection_name> python -m streamlit run app.py
 ```
+
+Confirm that profile targets the intended account and has access to the configured stage. Hosted Streamlit uses its embedded identity. For isolated tests, set `VIDPREP_STAGE_FQN` to a test-only stage and `VIDPREP_CACHE_DIR` to a fresh local directory. Stage names must contain three unquoted identifiers. Never commit connection credentials.
 
 > aside negative
 > **Important**: `st.connection("snowflake")` sets `snowflake.connector.paramstyle` to `"qmark"` as a side effect. Every SQL statement in this app uses `?` placeholders, never `%s`; mixing in `%s` produces a confusing syntax error at the Snowflake parser, not a Python error.
 
-<!-- ------------------------ -->
 ## Acquire the Media
 
-`acquire.py` normalizes both input paths (a local upload and a YouTube URL) into one `AcquiredMedia` object that the rest of the pipeline consumes identically.
-
-For YouTube links, `yt-dlp` fetches metadata (title, description, existing chapters, captions) and downloads audio for transcription plus a small local preview video:
+`acquire.py` saves the uploaded file and wraps it in one `AcquiredMedia` object that the rest of the app consumes. Start with media you own or are authorized to process. Uploads use unique temporary filenames, so an uploaded filename cannot overwrite another file, and the cache key is a hash of the file's contents:
 
 ```python
-def _base_ydl_opts() -> dict:
-    """Common yt-dlp options. Uses a real logged-in session's cookies (if
-    present) to get past YouTube's bot-detection on datacenter/cloud IPs
-    (e.g. Snowflake SPCS); this requires a JS runtime (deno, installed as a
-    dependency) to solve YouTube's signature challenges for the default web
-    client. Note: don't override player_client here: clients like
-    'android'/'tv_embedded' explicitly refuse to use cookies, which would
-    silently break authenticated access."""
-    opts: dict = {}
-    if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-        opts["cookiefile"] = YOUTUBE_COOKIES_FILE
-    return opts
+def acquire_from_upload(uploaded_file) -> AcquiredMedia:
+    """Save a Streamlit UploadedFile to disk and wrap it as AcquiredMedia."""
+    ext = os.path.splitext(uploaded_file.name)[1].lstrip(".").lower()
+    if ext not in _SUPPORTED_VIDEO_EXTS and ext not in _SUPPORTED_AUDIO_EXTS:
+        raise AcquisitionError(
+            f"Unsupported file type '.{ext}'. AI_TRANSCRIBE supports: "
+            f"{sorted(_SUPPORTED_VIDEO_EXTS | _SUPPORTED_AUDIO_EXTS)}"
+        )
+
+    with tempfile.NamedTemporaryFile(dir=TMP_DIR, suffix=f".{ext}", delete=False) as destination:
+        dest_path = destination.name
+        destination.write(uploaded_file.getbuffer())
+
+    file_hash = _file_hash(dest_path)
+    media_kind = "video" if ext in _SUPPORTED_VIDEO_EXTS else "audio"
+
+    return AcquiredMedia(
+        source_type="upload",
+        local_media_path=dest_path,
+        media_kind=media_kind,
+        cache_key=f"upload_{file_hash}",
+        title=os.path.splitext(uploaded_file.name)[0],
+    )
 ```
 
-Two things worth calling out from real-world debugging of this integration:
+Uploaded video files double as the preview player's source and the input for thumbnail frame extraction. Audio-only uploads get an audio player instead, and the thumbnail tab reports that no video frames are available.
 
-- **Cloud IPs get bot-detection blocked by YouTube.** Client spoofing (pretending to be a mobile app) does not fix this; the fix is real, logged-in session cookies (exported once locally with `yt-dlp --cookies-from-browser chrome --cookies youtube_cookies.txt` and shipped as an app artifact).
-- **Cookies and non-browser clients don't mix.** `yt-dlp`'s `android`/`tv_embedded` clients silently refuse to use cookies, which breaks authenticated access without an obvious error. Stick to the default `web` client, which needs a JavaScript runtime (`deno`) to solve YouTube's signature challenge.
-
-A small, low-resolution preview video is also downloaded for the UI player, muxing a video-only stream with an audio-only stream via `ffmpeg`, since most videos have no single pre-combined file below 360p:
-
-```python
-preview_opts = {
-    **_base_ydl_opts(),
-    "quiet": True,
-    "no_warnings": True,
-    "format": (
-        "bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/"
-        "bestvideo[height<=240]+bestaudio/"
-        "best[height<=240]/worst[ext=mp4]/worst"
-    ),
-    "merge_output_format": "mp4",
-    "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
-    "outtmpl": preview_template,
-}
-```
-
-<!-- ------------------------ -->
 ## Transcribe with AI_TRANSCRIBE
 
-`transcribe.py` builds a single, global word-level timeline for the media: the ground truth every downstream timestamp is resolved against.
+`transcribe.py` builds a single transcript timeline for the media. Downstream timestamps are resolved against that timeline, so their accuracy depends on the transcription.
 
 `AI_TRANSCRIBE` has a practical limit on media length when requesting word-level timestamps, so longer media is split into chunks with `ffmpeg`, transcribed independently, and re-based onto one continuous timeline using each chunk's *measured* duration (not the requested split point, which can drift):
 
@@ -205,19 +178,20 @@ def _transcribe_chunk_with_ai_transcribe(chunk_path: str) -> dict:
         f"SELECT AI_TRANSCRIBE(TO_FILE('@{STAGE_FQN}', ?), "
         "OBJECT_CONSTRUCT('timestamp_granularity', 'word'))"
     )
-    rows = run_query(sql, params=(staged_name,))
-    if not rows or rows[0][0] is None:
-        raise TranscriptionError(f"AI_TRANSCRIBE returned no result for {chunk_path}.")
     try:
-        run_query(f"REMOVE '@{STAGE_FQN}/{staged_name}'")
-    except Exception:
-        pass  # cleanup best-effort; not fatal
-    return json.loads(rows[0][0])
+        rows = run_query(sql, params=(staged_name,))
+        if not rows or rows[0][0] is None:
+            raise TranscriptionError("AI_TRANSCRIBE returned no result.")
+        return json.loads(rows[0][0])
+    finally:
+        try:
+            run_query(f"REMOVE '@{STAGE_FQN}/{staged_name}'")
+        except Exception:
+            logging.getLogger(__name__).warning("Staged media cleanup failed; check the configured stage.")
 ```
 
-When a YouTube video already has manually-written captions, VidPrep uses those directly instead of calling `AI_TRANSCRIBE`. It's free and instant, at the cost of coarser cue-level (rather than word-level) timing.
+Cleanup is attempted even if transcription or response parsing fails. A cleanup warning means you should inspect the stage and remove only the files from your own run. Transcripts are cached by a hash of the uploaded file's contents, so uploading the same file again reuses its transcript.
 
-<!-- ------------------------ -->
 ## Generate with AI_COMPLETE
 
 This is the section that enforces VidPrep's core correctness rule. `generate.py` never asks the model for a timestamp. It only asks for a `word_index` into the transcript array it was shown, tagged inline as `[INDEX]word`:
@@ -243,24 +217,33 @@ _CHAPTER_SCAN_SCHEMA = {
 }
 ```
 
-The actual `AI_COMPLETE` call passes this schema as a structured `response_format`, guaranteeing valid JSON back:
+The `AI_COMPLETE` call requests structured JSON with this schema. A request can occasionally return NULL, so the helper retries a bounded number of times before reporting an error:
 
 ```python
 def _ai_complete_json(prompt: str, schema: dict) -> dict:
     sql = "SELECT AI_COMPLETE(?, ?, PARSE_JSON(?), PARSE_JSON(?))"
     model_params = json.dumps({"temperature": 0.2, "max_tokens": COMPLETE_MAX_TOKENS})
     response_format = json.dumps({"type": "json", "schema": schema})
-    rows = run_query(sql, params=(COMPLETE_MODEL, prompt, model_params, response_format))
-    if not rows or rows[0][0] is None:
-        raise GenerationError("AI_COMPLETE returned no result.")
-    raw = rows[0][0]
-    parsed = json.loads(raw) if isinstance(raw, str) else raw
-    return parsed
+    params = (COMPLETE_MODEL, prompt, model_params, response_format)
+    for attempt in range(1, AI_COMPLETE_ATTEMPTS + 1):
+        rows = run_query(sql, params=params)
+        if rows and rows[0][0] is not None:
+            raw = rows[0][0]
+            # AI_COMPLETE with response_format returns the structured object directly.
+            return json.loads(raw) if isinstance(raw, str) else raw
+        if attempt < AI_COMPLETE_ATTEMPTS:
+            time.sleep(AI_COMPLETE_RETRY_DELAY_SECONDS * attempt)
+    raise GenerationError(
+        f"AI_COMPLETE returned no result after {AI_COMPLETE_ATTEMPTS} attempts. "
+        "This is usually transient; please try again."
+    )
 ```
+
+The generated result and each extra (titles, quotes, FAQ) are cached under a key that includes a hash of the model and the inputs the prompt uses, so a changed transcript or regenerated result never reuses stale suggestions.
 
 This app uses `claude-sonnet-5` as the `AI_COMPLETE` model (set in `config.py`'s `COMPLETE_MODEL`), configurable to any model your account has access to.
 
-The transcript is scanned in overlapping word-count windows (not the whole thing in one call) so long videos still get even chapter coverage, and every returned `word_index` is validated against the actual transcript length before being trusted:
+The transcript is scanned in overlapping word-count windows rather than one full-transcript call. Returned indices are converted to integers and clamped to the transcript's bounds. This keeps timestamps within the transcript; it does not establish that the selected chapter boundary is suitable:
 
 ```python
 def _resolve_and_clean_chapters(words, raw_candidates: list[dict]) -> list[Chapter]:
@@ -295,14 +278,13 @@ _DESCRIPTION_SCHEMA = {
 }
 ```
 
-<!-- ------------------------ -->
 ## Add Publishing Extras
 
 `enhance.py` layers eight more publishing-prep features on top of the core pipeline, following the same "never invent, always resolve" rule:
 
 - **Titles, category, and an end-screen suggestion** come from one bundled `AI_COMPLETE` call. The category is constrained to YouTube's fixed list of categories and validated against it in code.
 - **A SEO checklist** is pure Python (no model call at all), checking description length, keyword usage, call-to-action presence, title length, and chapter count.
-- **Thumbnail candidates** are real JPEG frames extracted with `ffmpeg` at each chapter's timestamp, not AI-generated images.
+- **Thumbnail candidates** are real JPEG frames extracted with `ffmpeg` near each chapter start, using a two-second offset where the media duration permits.
 - **Pull quotes** reuse the same chunked-scan pattern as chapters: the model picks a `start_word_index`/`end_word_index` span, and the quote text is built verbatim from the transcript:
 
 ```python
@@ -322,12 +304,21 @@ def generate_quotes(media: AcquiredMedia, transcript: Transcript, max_quotes: in
 - **Caption files** (`.srt`/`.vtt`) are built deterministically from the word-level transcript by grouping words into cues, with no model call needed.
 - **An FAQ** phrases each chapter as a question, tied back to that chapter's real `start_seconds` by index, never a model-invented timestamp.
 
-<!-- ------------------------ -->
-## Build the Streamlit UI
+## Build the UI
 
-`app.py` wraps the Input controls in a bordered container, then, once a result exists in `st.session_state`, renders the Output section as four tabs. The three "extras" tabs are lazy: each has its own **Generate** button, and results are cached in `st.session_state["extras"]` so switching tabs doesn't lose them or re-trigger a model call:
+`app.py` wraps the Input controls in a bordered container, then, once a result exists in `st.session_state`, renders the Output section as four tabs. The tab set has a `key` and `on_change="rerun"` (available in Streamlit 1.64 and later), so the selected tab survives the rerun that every button click triggers. Without it, clicking an extras button would send the user back to Overview:
 
-![VidPrep Input section: choose a video file or YouTube link, then click Generate to run AI_TRANSCRIBE and AI_COMPLETE](assets/01-input-upload.png)
+![VidPrep Input section: upload a video or audio file, then click Generate to run AI_TRANSCRIBE and AI_COMPLETE](assets/01-input-upload.png)
+
+```python
+tab_overview, tab_titles_seo, tab_thumbs, tab_captions = st.tabs(
+    ["Overview", "Titles & SEO", "Thumbnails & Clips", "Captions & FAQ"],
+    key="output_tab",
+    on_change="rerun",
+)
+```
+
+The three "extras" tabs are lazy: each has its own **Generate** button, and results are kept in `st.session_state["extras"]` so switching tabs doesn't lose them or re-trigger a model call:
 
 ```python
 with tab_titles_seo:
@@ -344,12 +335,13 @@ with tab_titles_seo:
         st.code("\n".join(titles_seo.titles), language=None)
 ```
 
-`st.session_state["extras"]` is reset to an empty dict every time a new video finishes processing, so stale results from a previous run never linger into a new one.
+The app clears previous media, transcript, results, extras, and the selected tab when Generate is clicked, including when input is missing or the next request fails. A failed request therefore cannot leave another video's output displayed as its result, and each new result opens on Overview.
 
-<!-- ------------------------ -->
+If a model call still returns no result after its retries, the tab shows a "Generation failed" message. Click that tab's Generate button again; earlier results stay in place.
+
 ## Deploy to Snowflake
 
-VidPrep runs on the [Streamlit-in-Snowflake container runtime](https://docs.snowflake.com/en/developer-guide/streamlit/app-development/runtime-environments) rather than the classic warehouse runtime, because it needs outbound internet access (for `yt-dlp`) and a system-level `ffmpeg`, neither of which the warehouse runtime supports.
+VidPrep runs on the [Streamlit-in-Snowflake container runtime](https://docs.snowflake.com/en/developer-guide/streamlit/app-development/runtime-environments), using Python dependencies and the `ffmpeg` executable bundled by `imageio-ffmpeg`. The only outbound access it needs is PyPI, for installing those dependencies when the container starts.
 
 Define the deployment in `snowflake.yml`:
 
@@ -367,7 +359,6 @@ entities:
     compute_pool: VIDPREP_COMPUTE_POOL
     external_access_integrations:
       - PYPI_ACCESS
-      - VIDPREP_EAI
     main_file: app.py
     artifacts:
       - app.py
@@ -379,27 +370,38 @@ entities:
       - config.py
       - snowflake_conn.py
       - pyproject.toml
-      - youtube_cookies.txt
 ```
 
-The `snowflake.yml` in this repo references the exact object names created in Setup above. If you named any of yours differently, update `identifier.database`, `query_warehouse`, `compute_pool`, and `external_access_integrations` in `snowflake.yml` to match before deploying. Update `config.py`'s `STAGE_FQN` to match the stage you created (`VIDPREP_DB.APPS.VIDPREP_STAGE`), export your own YouTube cookies file (`yt-dlp --cookies-from-browser chrome --cookies youtube_cookies.txt`) into the project directory, then deploy:
+Check that `snowflake.yml` references the resources you created in Setup. If you chose different names, update the identifier, warehouse, compute pool, integrations, and `config.py` stage default together. Confirm each listed artifact exists and no credentials are included. Use a distinct app name for a test deployment; `--replace` must not overwrite an app you need to preserve.
 
 ```bash
 snow streamlit deploy vidprep --connection <your_connection_name> --replace
 ```
 
-The first deploy resolves and locks Python dependencies inside the container, which can take a few minutes. If you later change `pyproject.toml`, redeploy with `--prune` to clear the stale lockfile left on the stage.
+The first deploy resolves and locks Python dependencies inside the container, which can take a few minutes. If you later change `pyproject.toml`, redeploy with `--prune` to clear the stale lockfile left on the stage. The keyed output tabs require Streamlit 1.64 or later; if the deployed app fails on `st.tabs`, confirm the container resolved a version that satisfies the `pyproject.toml` floor.
 
-<!-- ------------------------ -->
+## Verify the Workflow
+
+1. Upload a short original video and select Generate. If you don't have one, use `sample/vidprep_demo.mp4` from the companion repository: a two-minute synthetic narrated demo with eight sections and no real people or data. The screenshots in this guide were produced from it. Confirm a description, ordered chapter timestamps, and a working local preview appear. Click a later chapter timestamp and confirm the preview player moves to that time.
+2. Generate titles/SEO suggestions, thumbnails, pull quotes, and an FAQ from their respective tabs. Each tab should stay selected after its Generate button runs. Download both caption formats and inspect their text and timestamps.
+3. For a fresh live check, use a new cache directory and test stage. A cached result or a mocked unit test is not proof of a new Snowflake call.
+4. Review transcription accuracy, generated claims, and chapter suitability manually. Resolved timestamps refer to transcript entries; they do not guarantee correct transcription or ideal chapter boundaries.
+
+## Clean Up
+
+Save any generated outputs you need before removing tutorial resources. Stop only local app processes you started. Remove your run's temporary uploads, chunks, thumbnails, and caches after they are no longer needed by the preview.
+
+Inspect the configured stage for leftover media, including files from failed requests, and remove only your own run's files. Ask the resource owner to remove the tutorial app and schema after confirming they are used exclusively for this exercise. Remove a tutorial-only warehouse or compute pool only if you created it and no other workload uses it. Keep shared databases, integrations, pools, warehouses, and preexisting apps unchanged. Do not use a broad cleanup command against a shared environment.
+
 ## Conclusion And Resources
 
-Congratulations! You've successfully built and deployed VidPrep, a Streamlit-in-Snowflake app that turns a raw video into a fully publish-ready package: word-accurate chapters, a description, SEO titles/keywords/category, thumbnail candidates, pull quotes, caption files, and an FAQ, all generated by Snowflake Cortex and verified against real transcript data rather than trusted blindly.
+VidPrep turns an uploaded video into draft publishing materials: chapters, a description, titles and keywords, thumbnail candidates, pull quotes, captions, and an FAQ. Chapter timestamps and quote spans are resolved from transcript data in code. Review those outputs before publishing.
 
 ### What You Learned
 - How to get word-level timestamped transcripts from `AI_TRANSCRIBE`, including chunking long media
-- How to use `AI_COMPLETE`'s structured JSON response format to extract reliable, schema-validated output from an LLM
+- How to request structured JSON from `AI_COMPLETE` and resolve returned indices against transcript data
 - Why resolving timestamps from real data in code, rather than trusting a model to emit them, eliminates a whole class of hallucination bugs
-- How to deploy a Streamlit app that needs outbound network access using the container runtime, a compute pool, and an External Access Integration
+- How to deploy a Streamlit app on the container runtime with a compute pool and an External Access Integration for PyPI
 
 ### Related Resources
 
@@ -412,4 +414,3 @@ Documentation:
 
 Additional Reading:
 - [ai-powered-video-publishing on GitHub](https://github.com/sfc-gh-cnantasenamat/ai-powered-video-publishing)
-- [yt-dlp documentation](https://github.com/yt-dlp/yt-dlp)
